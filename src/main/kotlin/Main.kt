@@ -7,15 +7,12 @@ import java.sql.DriverManager
 import java.sql.ResultSet
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import com.fasterxml.jackson.module.kotlin.readValue
-import org.mindrot.jbcrypt.BCrypt
 import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.*
 import javax.crypto.Cipher
-import javax.crypto.KeyGenerator
-import javax.crypto.SecretKey
 import javax.crypto.spec.SecretKeySpec
 
 fun main() {
@@ -38,62 +35,89 @@ fun main() {
 
     port(8080)
 
+    // Routes
+    // Get all entries
     get("/entries") { _, res ->
         res.type("application/json")
         fetchEntries(connection, objectMapper)
     }
+    // Get entry by id
+    get("/entries/:id") { req, res ->
+        res.type("application/json")
+        fetchEntryById(connection, objectMapper, req.params(":id").toInt(), secretKey)
+    }
 
+    // Add new entry to db
     post("/entries") { req, res ->
         try {
             val entry = objectMapper.readValue<Entry>(req.body())
+            val (status, message) = insertEntry(connection, entry, secretKey)
 
-            val finalPassword = if (entry.password == "genpass") {
-                generateRandomPassword()
-            } else {
-                entry.password
-            }
-
-            val pwnedMessage = if (isPasswordPwned(finalPassword)) {
-                "WARNING! This password was compromised in a known data breach!"
-            } else {
-                null
-            }
-
-            val encryptedPassword = encryptPassword(finalPassword, secretKey)
-
-            insertEntry(connection, entry.name, entry.username, encryptedPassword)
-            res.status(201)
-
-            return@post if (pwnedMessage != null) {
-                "Entry added successfully\n$pwnedMessage"
-            } else {
-                "Entry added successfully"
-            }
+            res.status(status)
+            return@post message
         } catch (e: Exception) {
-            println("Error: ${e.message}")
-            res.status(500)
-            return@post "Internal Server Error: ${e.message}"
+            e.printStackTrace()
+            res.status(400)
+            return@post "Invalid request body."
         }
     }
+
+    // Check password strength of entry by id
     get("/check-strength/:id") { req, res ->
         res.type("application/json")
         try {
-            val id = req.params(":id")
+            val id = req.params(":id").toInt()
             return@get checkPasswordStrength(connection, objectMapper, id, secretKey)
         } catch (e: Exception) {
             e.printStackTrace()
             res.status(500)
-            return@get "Internal Server Error: ${e.message}"
+            return@get "Entry #${req.params(":id")} not found."
+        }
+    }
+
+    // Delete entry by id
+    delete("/entries/:id") { req, res ->
+        val id = req.params(":id").toIntOrNull()
+
+        if (id == null) {
+            res.status(400)
+            return@delete "Please provide a valid ID."
         }
 
+        val (status, message) = deleteEntryById(connection, id)
+        res.status(status)
+        return@delete message
+
+    }
+
+    // Update entry by id
+    put("/entries/:id") { req, res ->
+        val id = req.params(":id").toIntOrNull()
+
+        if (id == null) {
+            res.status(400)
+            return@put "Please provide a valid ID."
+        }
+
+        try {
+            val entry = objectMapper.readValue<Entry>(req.body())
+            val (status, message) = updateEntryById(connection, id, entry, secretKey)
+
+            res.status(status)
+            return@put message
+        } catch (e: Exception) {
+            e.printStackTrace()
+            res.status(400)
+            return@put "Invalid request body."
+        }
     }
 }
 
-data class Entry(val name: String, val username: String, val password: String)
 
 fun connectToDatabase(url: String): Connection {
     return DriverManager.getConnection(url)
 }
+
 
 // Get all entries in db
 fun fetchEntries(connection: Connection, objectMapper: ObjectMapper): String {
@@ -112,18 +136,73 @@ fun fetchEntries(connection: Connection, objectMapper: ObjectMapper): String {
     return objectMapper.writeValueAsString(entries)
 }
 
-// Add entry to db
-fun insertEntry(connection: Connection, name: String, username: String, password: String) {
+
+// Get entry by id
+fun fetchEntryById(connection: Connection, objectMapper: ObjectMapper, id: Int, secretKey: SecretKeySpec): String {
     val preparedStatement = connection.prepareStatement(
-        "INSERT INTO entries (name, username, password) VALUES (?, ?, ?);"
+        "SELECT * FROM entries WHERE id = ?"
     )
-    preparedStatement.setString(1, name)
-    preparedStatement.setString(2, username)
-    preparedStatement.setString(3, password)
-    preparedStatement.executeUpdate()
+    preparedStatement.setInt(1, id)
+    val resultSet: ResultSet = preparedStatement.executeQuery()
+    if (resultSet.next()) {
+        val entry = mutableMapOf(
+            "id" to resultSet.getInt("id"),
+            "name" to resultSet.getString("name"),
+            "username" to resultSet.getString("username"),
+            "password" to resultSet.getString("password")
+        )
+
+        entry["password"] = decryptPassword(entry["password"].toString(), secretKey)
+        return objectMapper.writeValueAsString(entry)
+    } else {
+        return objectMapper.writeValueAsString("Entry #$id not found.")
+    }
 }
 
-fun checkPasswordStrength(connection: Connection, objectMapper: ObjectMapper, id: String, secretKey: SecretKeySpec): String {
+
+// Add entry to db
+fun insertEntry(connection: Connection, entry: Entry, secretKey: SecretKeySpec): Pair<Int, String> {
+    return try {
+        val finalPassword = if (entry.password == "genpass") {
+            generateRandomPassword()
+        } else {
+            entry.password
+        }
+
+        val pwnedMessage = if (isPasswordPwned(finalPassword)) {
+            "WARNING! This password was compromised in a known data breach!"
+        } else {
+            null
+        }
+
+        val encryptedPassword = encryptPassword(finalPassword, secretKey)
+
+        val preparedStatement = connection.prepareStatement(
+            "INSERT INTO entries (name, username, password) VALUES (?, ?, ?);"
+        )
+        preparedStatement.setString(1, entry.name)
+        preparedStatement.setString(2, entry.username)
+        preparedStatement.setString(3, encryptedPassword)
+        preparedStatement.executeUpdate()
+
+        201 to if (pwnedMessage != null) {
+            "Entry added successfully\n$pwnedMessage"
+        } else {
+            "Entry added successfully."
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+        500 to "Internal Server Error: ${e.message}"
+    }
+}
+
+
+fun checkPasswordStrength(
+    connection: Connection,
+    objectMapper: ObjectMapper,
+    id: Int,
+    secretKey: SecretKeySpec
+): String {
     val resultSet: ResultSet = connection.createStatement().executeQuery(
         "SELECT password FROM entries WHERE id=$id"
     )
@@ -133,7 +212,7 @@ fun checkPasswordStrength(connection: Connection, objectMapper: ObjectMapper, id
         null
     }
 
-    if (password == null){
+    if (password == null) {
         return objectMapper.writeValueAsString("No entry found with id #$id")
     }
 
@@ -168,6 +247,68 @@ fun checkPasswordStrength(connection: Connection, objectMapper: ObjectMapper, id
     return objectMapper.writeValueAsString(response)
 }
 
+
+// Delete entry in db
+fun deleteEntryById(connection: Connection, id: Int): Pair<Int, String> {
+    return try {
+        val preparedStatement = connection.prepareStatement("DELETE FROM entries WHERE id = ?")
+        preparedStatement.setInt(1, id)
+        val rowsAffected = preparedStatement.executeUpdate()
+
+        if (rowsAffected > 0) {
+            200 to "Entry #$id was successfully deleted."
+        } else {
+            404 to "Entry #$id not found."
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+        500 to "Internal Server Error: ${e.message}"
+    }
+}
+
+
+// Update entry in db
+fun updateEntryById(connection: Connection, id: Int, entry: Entry, secretKey: SecretKeySpec): Pair<Int, String> {
+    return try {
+        val finalPassword = if (entry.password == "genpass") {
+            generateRandomPassword()
+        } else {
+            entry.password
+        }
+
+        val pwnedMessage = if (isPasswordPwned(finalPassword)) {
+            "WARNING! This password was compromised in a known data breach!"
+        } else {
+            null
+        }
+
+        val encryptedPassword = encryptPassword(finalPassword, secretKey)
+
+        val preparedStatement = connection.prepareStatement(
+            "UPDATE entries SET name = ?, username = ?, password = ? WHERE id = ?"
+        )
+        preparedStatement.setString(1, entry.name)
+        preparedStatement.setString(2, entry.username)
+        preparedStatement.setString(3, encryptedPassword)
+        preparedStatement.setInt(4, id)
+        val rowsAffected = preparedStatement.executeUpdate()
+
+        if (rowsAffected > 0) {
+            200 to if (pwnedMessage == null) {
+                "Entry #$id successfully updated."
+            } else {
+                "Entry #$id successfully updated.\n$pwnedMessage"
+            }
+        } else {
+            404 to "Entry #$id not found."
+        }
+    } catch (e: Exception) {
+        e.printStackTrace()
+        500 to "Internal Server Error: ${e.message}"
+    }
+}
+
+
 fun encryptPassword(password: String, secretKey: SecretKeySpec): String {
     val cipher = Cipher.getInstance("AES")
     cipher.init(Cipher.ENCRYPT_MODE, secretKey)
@@ -175,12 +316,14 @@ fun encryptPassword(password: String, secretKey: SecretKeySpec): String {
     return Base64.getEncoder().encodeToString(encryptedBytes)
 }
 
+
 fun decryptPassword(encryptedPassword: String, secretKey: SecretKeySpec): String {
     val cipher = Cipher.getInstance("AES")
     cipher.init(Cipher.DECRYPT_MODE, secretKey)
     val decryptedBytes = cipher.doFinal(Base64.getDecoder().decode(encryptedPassword))
     return String(decryptedBytes)
 }
+
 
 // Generate random password of length 16 with at least:
 // 1 uppercase, lowercase, digit and special character
@@ -205,6 +348,7 @@ fun generateRandomPassword(): String {
 
     return password.toList().shuffled(random).joinToString("")
 }
+
 
 // Check if password exists in a known data breach
 fun isPasswordPwned(password: String): Boolean {
