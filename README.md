@@ -9,5 +9,4 @@ This project's purpose was for me to learn new libraries and technologies within
 - Jackson (Parsing JSON & Object Mapper)
 - JBCrypt (Hashing) => Eventually changed to AES Encryption
 - javax.crypto (Encryption)
-- 
  
